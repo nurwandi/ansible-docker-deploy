@@ -1,0 +1,133 @@
+---
+# Generic Application Rollback Playbook
+# Purpose: Rollback to previous deployment
+# Variables: Pass via extra vars (-e) from CI/CD
+
+- name: Rollback Application
+  hosts: production
+  vars_files:
+    - ../vars/defaults.yml
+
+  vars:
+    rollback_timestamp: "{{ ansible_facts['date_time']['epoch'] }}"
+    rollback_id: "rollback-{{ ansible_facts['date_time']['date'] }}-{{ ansible_facts['date_time']['hour'] }}{{ ansible_facts['date_time']['minute'] }}"
+
+  tasks:
+    # ============================================================================
+    # PHASE 1: PRE-ROLLBACK (Validation)
+    # ============================================================================
+
+    - name: Display rollback information
+      debug:
+        msg:
+          - "Rollback ID: {{ rollback_id }}"
+          - "Target: {{ ansible_host }}"
+          - "Deployment Path: {{ deployment_path }}"
+
+    - name: Check if backup exists
+      shell: ls -t {{ backup_path }}/docker-compose.yml.*.backup 2>/dev/null | head -1
+      register: latest_backup
+      failed_when: latest_backup.stdout == ""
+      changed_when: false
+      args:
+        executable: /bin/bash
+      # Find the most recent backup file
+
+    - name: Display backup that will be restored
+      debug:
+        msg: "Will restore: {{ latest_backup.stdout }}"
+
+    - name: Confirm rollback (pause for 5 seconds)
+      pause:
+        seconds: 5
+        prompt: "Rolling back to {{ latest_backup.stdout }}. Press Ctrl+C to cancel..."
+
+    # ============================================================================
+    # PHASE 2: ROLLBACK EXECUTION
+    # ============================================================================
+
+    - name: Stop current containers
+      command:
+        cmd: docker compose down --timeout {{ container_stop_timeout }}
+        chdir: "{{ deployment_path }}"
+      ignore_errors: yes
+      # Stop currently running containers
+
+    - name: Backup current docker-compose.yml (before rollback)
+      copy:
+        src: "{{ deployment_path }}/docker-compose.yml"
+        dest: "{{ backup_path }}/docker-compose.yml.{{ rollback_timestamp }}.pre-rollback"
+        remote_src: yes
+      ignore_errors: yes
+      # Save current config in case we need to roll forward
+
+    - name: Restore previous docker-compose.yml
+      copy:
+        src: "{{ latest_backup.stdout }}"
+        dest: "{{ deployment_path }}/docker-compose.yml"
+        remote_src: yes
+        owner: "{{ deployment_user }}"
+        mode: '0644'
+      # Restore the backup
+
+    - name: Pull rollback images (if they exist)
+      command: docker pull {{ item }}
+      loop:
+        - "{{ frontend_rollback_image }}"
+        - "{{ backend_rollback_image }}"
+      ignore_errors: yes
+      # Try to pull rollback-tagged images
+
+    - name: Start containers with previous configuration
+      command:
+        cmd: docker compose up -d
+        chdir: "{{ deployment_path }}"
+      register: compose_up
+      # Start containers with restored config
+
+    - name: Wait for containers to start
+      pause:
+        seconds: 10
+      # Give containers time to start
+
+    # ============================================================================
+    # PHASE 3: VERIFICATION
+    # ============================================================================
+
+    - name: Check container status
+      command: docker ps --filter "name={{ container_name_prefix }}-" --format "{{`{{.Names}}`}} - {{`{{.Status}}`}}"
+      register: container_status
+      changed_when: false
+
+    - name: Display container status
+      debug:
+        msg: "{{ container_status.stdout_lines }}"
+
+    - name: Verify at least one container is running
+      assert:
+        that:
+          - container_status.stdout | length > 0
+        fail_msg: "No {{ container_name_prefix }} containers are running after rollback!"
+
+    # ============================================================================
+    # PHASE 4: FINALIZATION
+    # ============================================================================
+
+    - name: Log rollback
+      lineinfile:
+        path: "{{ deployment_path }}/deployment.log"
+        line: "{{ ansible_facts['date_time']['iso8601'] }} | {{ rollback_id }} | ROLLBACK | Restored: {{ latest_backup.stdout }}"
+        create: yes
+      # Log the rollback operation
+
+    - name: Display rollback success message
+      debug:
+        msg:
+          - "===================================================="
+          - "✅ ROLLBACK SUCCESSFUL"
+          - "===================================================="
+          - "Rollback ID: {{ rollback_id }}"
+          - "Restored from: {{ latest_backup.stdout }}"
+          - "Containers:"
+          - "{{ container_status.stdout_lines }}"
+          - "===================================================="

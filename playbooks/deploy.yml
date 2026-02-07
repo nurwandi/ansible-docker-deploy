@@ -1,0 +1,183 @@
+---
+# Generic Application Deployment Playbook
+# Purpose: Deploy frontend & backend containers
+# Variables: Pass via extra vars (-e) from CI/CD
+
+- name: Deploy Application
+  hosts: production
+  vars_files:
+    - ../vars/defaults.yml
+
+  # Deployment tracking
+  vars:
+    deployment_timestamp: "{{ ansible_facts['date_time']['epoch'] }}"
+    deployment_id: "deploy-{{ ansible_facts['date_time']['date'] }}-{{ ansible_facts['date_time']['hour'] }}{{ ansible_facts['date_time']['minute'] }}"
+
+  tasks:
+    # ============================================================================
+    # PHASE 1: PRE-DEPLOYMENT (Preparation & Validation)
+    # ============================================================================
+
+    - name: Display deployment information
+      debug:
+        msg:
+          - "Deployment ID: {{ deployment_id }}"
+          - "Target: {{ ansible_host }}"
+          - "Deployment Path: {{ deployment_path }}"
+          - "Frontend Image: {{ frontend_image }}"
+          - "Backend Image: {{ backend_image }}"
+
+    - name: Create deployment directory
+      file:
+        path: "{{ deployment_path }}"
+        state: directory
+        owner: "{{ deployment_user }}"
+        mode: '0755'
+
+    - name: Create backup directory
+      file:
+        path: "{{ backup_path }}"
+        state: directory
+        owner: "{{ deployment_user }}"
+        mode: '0755'
+
+    - name: Install required packages
+      apt:
+        name:
+          - docker.io
+          - docker-compose-plugin
+          - curl
+          - jq  # For parsing JSON from docker commands
+        state: present
+        update_cache: yes
+      # Ensure Docker and dependencies are installed
+      # Note: docker-compose-plugin provides 'docker compose' command
+      # Note: We use docker CLI directly, no need for Python packages
+
+    - name: Verify Docker Compose v2 is available
+      command: docker compose version
+      register: compose_version
+      failed_when: false
+      changed_when: false
+      # Verify that 'docker compose' command is available
+
+    - name: Ensure Docker service is running
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Login to Docker Hub
+      command:
+        cmd: docker login -u {{ dockerhub_username }} --password-stdin
+        stdin: "{{ dockerhub_token }}"
+      when: dockerhub_token is defined and dockerhub_token != "YOUR_DOCKERHUB_TOKEN_HERE"
+      no_log: true  # Don't log the password
+                    # Login to Docker Hub using token from secrets.yml
+                    # Skip if token not set (for public repositories)
+
+    - name: Check if docker-compose.yml exists (for backup)
+      stat:
+        path: "{{ deployment_path }}/docker-compose.yml"
+      register: existing_compose
+      # Check if there's an existing deployment
+
+    - name: Backup existing docker-compose.yml
+      copy:
+        src: "{{ deployment_path }}/docker-compose.yml"
+        dest: "{{ backup_path }}/docker-compose.yml.{{ deployment_timestamp }}.backup"
+        remote_src: yes
+      when: existing_compose.stat.exists
+      # Backup old compose file for rollback
+
+    - name: Tag current images as rollback (if containers exist)
+      shell: |
+        if docker images | grep -q "{{ dockerhub_username }}/{{ dockerhub_repository }}:frontend"; then
+          docker tag {{ frontend_image }} {{ frontend_rollback_image }}
+        fi
+        if docker images | grep -q "{{ dockerhub_username }}/{{ dockerhub_repository }}:backend"; then
+          docker tag {{ backend_image }} {{ backend_rollback_image }}
+        fi
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+      # Tag current images as rollback before pulling new ones
+
+    # ============================================================================
+    # PHASE 2: DEPLOYMENT (Pull Images & Deploy)
+    # ============================================================================
+
+    - name: Pull latest frontend image from Docker Hub
+      command: docker pull {{ frontend_image }}
+
+    - name: Pull latest backend image from Docker Hub
+      command: docker pull {{ backend_image }}
+
+    - name: Deploy docker-compose.yml from template
+      template:
+        src: ../templates/docker-compose.yml.j2
+        dest: "{{ deployment_path }}/docker-compose.yml"
+        owner: "{{ deployment_user }}"
+        mode: '0644'
+
+    - name: Verify deployment directory exists
+      stat:
+        path: "{{ deployment_path }}"
+      register: deployment_dir_check
+      failed_when: not deployment_dir_check.stat.exists
+
+    - name: Stop existing containers gracefully
+      command:
+        cmd: docker compose down --timeout {{ container_stop_timeout }}
+        chdir: "{{ deployment_path }}"
+      when: existing_compose.stat.exists
+      ignore_errors: yes
+      # Stop old containers with 30 second timeout
+      # Only run if docker-compose.yml exists from previous deployment
+
+    - name: Start new containers with docker compose
+      command:
+        cmd: docker compose up -d --force-recreate
+        chdir: "{{ deployment_path }}"
+      register: compose_output
+      # Start new containers with updated configuration
+
+    - name: Wait for containers to be ready
+      pause:
+        seconds: 10
+      # Give containers time to fully start
+
+    # ============================================================================
+    # ============================================================================
+
+    - name: Display deployment success message
+      debug:
+        msg:
+          - "===================================================="
+          - "✅ DEPLOYMENT SUCCESSFUL"
+          - "===================================================="
+          - "Deployment ID: {{ deployment_id }}"
+          - "Frontend: {{ frontend_image }}"
+          - "Backend: {{ backend_image }}"
+          - "Frontend URL: {{ frontend_health_url }}"
+          - "Backend URL: {{ backend_health_url }}"
+          - "===================================================="
+
+    - name: Cleanup old Docker images
+      shell: |
+        docker image prune -a -f --filter "until={{ image_cleanup_age }}"
+      args:
+        executable: /bin/bash
+      # Remove images older than 72 hours to save disk space
+
+    - name: Remove old backups (keep last 7 days)
+      shell: |
+        find {{ backup_path }} -name "docker-compose.yml.*.backup" -mtime +{{ backup_retention_days }} -delete
+      args:
+        executable: /bin/bash
+
+    - name: Log successful deployment
+      lineinfile:
+        path: "{{ deployment_path }}/deployment.log"
+        line: "{{ ansible_facts['date_time']['iso8601'] }} | {{ deployment_id }} | SUCCESS | Frontend: {{ frontend_image }} | Backend: {{ backend_image }}"
+        create: yes

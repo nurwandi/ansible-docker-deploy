@@ -1,0 +1,45 @@
+---
+# Default Configuration Values
+# These are non-sensitive default values that can be committed to the repository
+# Override these via extra vars (-e) in CI/CD or for different environments
+
+# Docker Configuration
+docker_network_name: app-network
+container_name_prefix: app
+
+# Port Mappings
+frontend_host_port: 80
+frontend_container_port: 80
+
+backend_host_port: 3000
+backend_container_port: 3000
+
+# Timeout Configuration
+container_stop_timeout: 30  # seconds for graceful shutdown
+deployment_timeout: 300     # total deployment timeout (5 minutes)
+
+# Health Check Configuration (if implemented)
+health_check_max_retries: 30
+health_check_delay: 2  # seconds
+frontend_expected_status: 200
+backend_expected_status: 200
+
+# Cleanup Configuration
+image_cleanup_age: 72h      # Remove images older than 72 hours
+backup_retention_days: 7
+
+# Derived Variables (computed from others)
+# Note: deployment_path must be provided via extra vars
+backup_path: "{{ deployment_path }}/backups"
+frontend_health_url: "http://{{ ansible_host }}:{{ frontend_host_port }}/"
+backend_health_url: "http://{{ ansible_host }}:{{ backend_host_port }}/health"
+
+# Image Configuration
+# Note: dockerhub_username and dockerhub_repository must be provided via extra vars
+# Fixed tags: frontend and backend
+frontend_image: "{{ dockerhub_username }}/{{ dockerhub_repository }}:frontend"
+backend_image: "{{ dockerhub_username }}/{{ dockerhub_repository }}:backend"
+
+# Rollback Images (tagged before deployment)
+frontend_rollback_image: "{{ dockerhub_username }}/{{ dockerhub_repository }}:frontend-rollback"
+backend_rollback_image: "{{ dockerhub_username }}/{{ dockerhub_repository }}:backend-rollback"
